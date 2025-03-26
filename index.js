@@ -1,6 +1,7 @@
 import express from 'express';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
+import cors from 'cors'
 import { adminAuthRoutes, studentRoutes, uploadRoutes } from './routes/index.js';
 
 import path from 'path';
@@ -18,6 +19,7 @@ ensureUploadDirectory;
 dotenv.config();
 
 const app = express();
+app.use(cors());
 
 
 app.use(express.json());
