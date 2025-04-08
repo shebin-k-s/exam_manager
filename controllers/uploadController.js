@@ -2,7 +2,7 @@ import xlsx from "xlsx";
 import fs from "fs";
 import path from "path";
 import Student from "../models/studentModel.js";
-
+import PDFDocument from "pdfkit";
 export const uploadExcel = async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ message: "No file uploaded!" });
@@ -48,6 +48,7 @@ export const uploadExcel = async (req, res) => {
         const maxSeatsPerClass = maxRows * columns.length;
 
         const seatAssignments = [];
+        const existingRecordsCount = {};
 
         for (const key in groupedByDateSession) {
             let rowCounter = 1;
@@ -107,6 +108,11 @@ export const uploadExcel = async (req, res) => {
                             session: student.session
                         });
 
+                        // Track records by key for reporting
+                        const recordKey = `${student.examDate}-${student.session}`;
+                        if (!existingRecordsCount[recordKey]) existingRecordsCount[recordKey] = 0;
+                        existingRecordsCount[recordKey]++;
+
                         console.log(`Assigned ${student.registerNumber} to Seat ${seat} in ${classRoom}`);
                     }
                 });
@@ -121,30 +127,61 @@ export const uploadExcel = async (req, res) => {
             }
         }
 
-        console.log("Total Seat Assignments:", seatAssignments.length);
+        console.log("Total Seat Assignments Prepared:", seatAssignments.length);
+        
         if (seatAssignments.length > 0) {
-            await Student.insertMany(seatAssignments);
-            console.log("Inserted into DB:", seatAssignments.length);
+            // Create operations for bulkWrite
+            const operations = [];
+            let newRecordsCount = 0;
+            let updatedRecordsCount = 0;
+            
+            for (const assignment of seatAssignments) {
+                // Create a unique filter to find existing records
+                const filter = {
+                    registerNumber: assignment.registerNumber,
+                    examDate: assignment.examDate,
+                    session: assignment.session
+                };
+                
+                // Use updateOne with upsert to either update existing or insert new
+                operations.push({
+                    updateOne: {
+                        filter: filter,
+                        update: { $set: assignment },
+                        upsert: true
+                    }
+                });
+            }
+            
+            // Execute bulk operations
+            if (operations.length > 0) {
+                const bulkResult = await Student.bulkWrite(operations);
+                
+                console.log("BulkWrite Result:", {
+                    insertedCount: bulkResult.insertedCount,
+                    modifiedCount: bulkResult.modifiedCount,
+                    upsertedCount: bulkResult.upsertedCount
+                });
+                
+                return res.status(201).json({
+                    message: "Excel file processed successfully!",
+                    stats: {
+                        totalProcessed: seatAssignments.length,
+                        newRecords: bulkResult.upsertedCount,
+                        updatedRecords: bulkResult.modifiedCount,
+                        unchanged: seatAssignments.length - (bulkResult.upsertedCount + bulkResult.modifiedCount)
+                    }
+                });
+            }
         }
-        // Generate Excel Output
-        // const outputWorkbook = xlsx.utils.book_new();
-        // const outputWorksheet = xlsx.utils.json_to_sheet(seatAssignments);
-        // xlsx.utils.book_append_sheet(outputWorkbook, outputWorksheet, "Seat Assignments");
-
-        // const outputPath = "seat_assignments.xlsx";
-        // xlsx.writeFile(outputWorkbook, outputPath);
-
-        // res.download(outputPath, "seat_assignments.xlsx", (err) => {
-        //     if (err) {
-        //         console.error("Error sending file:", err);
-        //         res.status(500).json({ error: "Error sending file" });
-        //     } else {
-        //         // fs.unlinkSync(outputPath); // Delete the file after download
-        //     }
-        // });
 
         return res.status(201).json({
-            message: "Excel file processed successfully!",
+            message: "Excel file processed, but no valid records found.",
+            stats: {
+                totalProcessed: 0,
+                newRecords: 0,
+                updatedRecords: 0
+            }
         });
 
     } catch (error) {
@@ -152,3 +189,217 @@ export const uploadExcel = async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 };
+
+
+export const downloadSeatAllocation = async (req, res) => {
+    try {
+        const { examDate, session } = req.query;
+
+        if (!examDate || !session) {
+            return res.status(400).json({ message: "examDate and session are required" });
+        }
+
+        const students = await Student.find({ examDate, session });
+
+        if (!students || students.length === 0) {
+            return res.status(404).json({ message: "No seat allocation found for this date and session" });
+        }
+
+        // Group students by classroom
+        const groupedByClassroom = {};
+        students.forEach(student => {
+            if (!groupedByClassroom[student.classRoom]) {
+                groupedByClassroom[student.classRoom] = {};
+            }
+            groupedByClassroom[student.classRoom][student.seatNumber] = student.registerNumber;
+        });
+
+        // PDF generation
+        const doc = new PDFDocument({ 
+            margin: 50, 
+            size: 'A4',
+            bufferPages: true
+        });
+        
+        const buffers = [];
+        doc.on("data", (chunk) => buffers.push(chunk));
+        doc.on("end", () => {
+            const pdfBuffer = Buffer.concat(buffers);
+            res.setHeader("Content-Type", "application/pdf");
+            res.setHeader("Content-Disposition", `attachment; filename=Seat_Allocation_${examDate}_${session}.pdf`);
+            res.send(pdfBuffer);
+        });
+
+        // Add title
+        doc.fontSize(16).text(`Seat Allocation - ${examDate} [${session}]`, { align: "center" });
+        doc.moveDown(1);
+
+        const columns = ["A", "B", "C", "D", "E", "F"];
+        const maxRows = 6;
+
+        // Define table dimensions
+        const tableMargin = 50;
+        const cellWidth = 80;
+        const cellHeight = 30;
+        const headerHeight = 30;
+        const tableHeight = maxRows * cellHeight;
+        const rowNumberWidth = 30;
+        
+        // Calculate page height limits
+        const pageHeight = doc.page.height;
+        const footerHeight = 20;
+        
+        // Track current Y position
+        let currentY = doc.y;
+        let currentPage = 1;
+        
+        // Function to draw a table for a classroom
+        const drawClassroomTable = (classRoom, seatMap) => {
+            // Check if there's enough space for the table + headers + margins
+            const neededHeight = tableHeight + headerHeight + 50;
+            
+            if (currentY + neededHeight > pageHeight - doc.page.margins.bottom - footerHeight) {
+                // Add page number to current page
+                doc.fontSize(10)
+                   .text(`Page ${currentPage}`, 
+                          doc.page.width / 2, 
+                          pageHeight - doc.page.margins.bottom - 15, 
+                          { align: 'center' });
+                
+                // Add a new page
+                doc.addPage();
+                currentPage++;
+                currentY = doc.page.margins.top;
+                
+                // Add title to new page
+                doc.fontSize(16)
+                   .text(`Seat Allocation - ${examDate} [${session}] (continued)`, 
+                          { align: "center" });
+                doc.moveDown(1);
+                currentY = doc.y;
+            }
+            
+            // Add classroom header with proper spacing
+            doc.fontSize(14)
+               .text(classRoom, { align: 'center', underline: true });
+            
+            // Move down after the title
+            currentY = doc.y + 15;
+            
+            // Define table areas
+            const headerY = currentY;
+            const tableStartY = headerY + headerHeight;
+            const tableWidth = columns.length * cellWidth;
+            
+            // Draw column headers (A-F)
+            for (let colIndex = 0; colIndex < columns.length; colIndex++) {
+                const x = tableMargin + (colIndex * cellWidth);
+                
+                // Draw a column header cell
+                doc.rect(
+                    x, 
+                    headerY, 
+                    cellWidth, 
+                    headerHeight
+                ).stroke();
+                
+                // Add centered column header text
+                doc.fontSize(14)
+                   .text(
+                      columns[colIndex],
+                      x,
+                      headerY + 10,
+                      { width: cellWidth, align: 'center' }
+                   );
+            }
+            
+            // Draw row numbers (1-6) on the left side
+            for (let row = 0; row < maxRows; row++) {
+                const y = tableStartY + (row * cellHeight);
+                
+                // Draw row number cell
+                doc.rect(
+                    tableMargin - rowNumberWidth, 
+                    y, 
+                    rowNumberWidth, 
+                    cellHeight
+                ).stroke();
+                
+                // Add centered row number text
+                doc.fontSize(14)
+                   .text(
+                      (row + 1).toString(),
+                      tableMargin - rowNumberWidth,
+                      y + 10,
+                      { width: rowNumberWidth, align: 'center' }
+                   );
+            }
+            
+            // Draw the main table
+            doc.rect(
+                tableMargin, 
+                tableStartY, 
+                tableWidth, 
+                tableHeight
+            ).stroke();
+            
+            // Draw horizontal divider lines
+            for (let rowIndex = 1; rowIndex < maxRows; rowIndex++) {
+                const y = tableStartY + (rowIndex * cellHeight);
+                doc.moveTo(tableMargin, y)
+                   .lineTo(tableMargin + tableWidth, y)
+                   .stroke();
+            }
+            
+            // Draw vertical divider lines
+            for (let colIndex = 1; colIndex < columns.length; colIndex++) {
+                const x = tableMargin + (colIndex * cellWidth);
+                doc.moveTo(x, tableStartY)
+                   .lineTo(x, tableStartY + tableHeight)
+                   .stroke();
+            }
+            
+            // Add seat assignments
+            for (let row = 0; row < maxRows; row++) {
+                for (let colIndex = 0; colIndex < columns.length; colIndex++) {
+                    const col = columns[colIndex];
+                    const x = tableMargin + (colIndex * cellWidth);
+                    const y = tableStartY + (row * cellHeight);
+                    
+                    const seat = `${col}${row + 1}`;
+                    const regNumber = seatMap[seat] || "---";
+                    
+                    doc.fontSize(10)
+                       .text(
+                          regNumber,
+                          x,
+                          y + 10,
+                          { width: cellWidth, align: 'center' }
+                       );
+                }
+            }
+            
+            // Move Y position for next table
+            currentY = tableStartY + tableHeight + 40;
+            doc.y = currentY;
+        };
+        
+        // Draw tables for all classrooms
+        for (const [classRoom, seatMap] of Object.entries(groupedByClassroom)) {
+            drawClassroomTable(classRoom, seatMap);
+        }
+        
+        // Add final page number
+        doc.fontSize(10)
+           .text(`Page ${currentPage}`, 
+                  doc.page.width / 2, 
+                  pageHeight - doc.page.margins.bottom - 15, 
+                  { align: 'center' });
+        
+        doc.end();
+
+    } catch (error) {
+        console.error("Error generating seat layout PDF:", error);
+        res.status(500).json({ error: "Internal Server Error" });
+    }
+}

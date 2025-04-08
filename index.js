@@ -2,7 +2,7 @@ import express from 'express';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import cors from 'cors'
-import { adminAuthRoutes, studentRoutes, uploadRoutes } from './routes/index.js';
+import { adminAuthRoutes, seatAllocationRoutes, studentRoutes, uploadRoutes } from './routes/index.js';
 
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -31,6 +31,8 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use("/api/v1/auth", adminAuthRoutes);
 app.use('/api/v1/upload', uploadRoutes);
 app.use('/api/v1/student', studentRoutes);
+app.use('/api/v1/seat-allocation', seatAllocationRoutes);
+
 
 ensureUploadDirectory();
 
