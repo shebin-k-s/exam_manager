@@ -32,6 +32,7 @@ app.use("/api/v1/auth", adminAuthRoutes);
 app.use('/api/v1/upload', uploadRoutes);
 app.use('/api/v1/student', studentRoutes);
 app.use('/api/v1/seat-allocation', seatAllocationRoutes);
+app.use('/api/v1/student-signpage', seatAllocationRoutes);
 
 
 ensureUploadDirectory();
